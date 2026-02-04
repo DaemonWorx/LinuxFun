@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # arch-usb-install-universal.sh
-# Universal (host-agnostic) Arch USB installer using a bootstrap Arch chroot
-# Result: Full Arch on USB, Btrfs (@ and @home), XFCE + LightDM, GRUB (UEFI+BIOS)
-# Requirements: x86-64 host, sudo, internet
+# Universal (host-agnostic) Arch USB installer using an Arch bootstrap chroot.
+# Result: Arch on USB, Btrfs (@/@home), XFCE + LightDM, GRUB (UEFI+BIOS).
+# Host: any x86-64 Linux with sudo + internet.
+
 set -euo pipefail
 
 # ---------- User options ----------
@@ -30,7 +31,7 @@ while [[ $# -gt 0 ]]; do
     --tz) TZ="$2"; shift 2;;
     --locale) LOCALE="$2"; shift 2;;
     *) echo "Unknown arg: $1"; exit 1;;
-  case_esac
+  esac
 done
 
 [[ -b "${DEVICE:-}" ]] || { echo "ERROR: --device must be a block device (e.g., /dev/sdb)"; exit 2; }
@@ -41,19 +42,17 @@ read -rp "Type IUNDERSTAND to continue: " ACK
 # ---------- Host prerequisites (auto-install) ----------
 need() { command -v "$1" >/dev/null 2>&1; }
 pm_install() {
-  if need apt-get; then apt-get update && apt-get install -y "$@"
-  elif need dnf; then dnf install -y "$@"
-  elif need yum; then yum install -y "$@"
-  elif need zypper; then zypper --non-interactive install "$@"
-  elif need pacman; then pacman -Sy --noconfirm --needed "$@"
-  elif need apk; then apk add --no-cache "$@"
-  else echo "No supported package manager found. Install ${*} manually."; exit 4
-  fi
+  if   need apt-get; then apt-get update && apt-get install -y "$@"
+  elif need dnf;     then dnf install -y "$@"
+  elif need yum;     then yum install -y "$@"
+  elif need zypper;  then zypper --non-interactive install "$@"
+  elif need pacman;  then pacman -Sy --noconfirm --needed "$@"
+  elif need apk;     then apk add --no-cache "$@"
+  else echo "No supported package manager found. Install ${*} manually."; exit 4; fi
 }
 
 for c in curl tar lsblk blkid wipefs partprobe sgdisk mkfs.vfat mkfs.btrfs zstd; do
-  need "$c" || pm_install \
-    curl tar util-linux gptfdisk dosfstools btrfs-progs e2fsprogs zstd
+  need "$c" || pm_install curl tar util-linux gptfdisk dosfstools btrfs-progs e2fsprogs zstd
 done
 
 # ---------- Prepare bootstrap chroot ----------
@@ -67,10 +66,18 @@ tar --zstd -xpf arch-bootstrap.tar.zst
 ROOT="${ARCH_TMP}/root.x86_64"
 
 # Bind mounts + DNS
-for d in dev proc sys run; do mount --rbind "/$d" "${ROOT}/$d"; mount --make-rslave "${ROOT}/$d"; done
+for d in dev proc sys run; do
+  mount --rbind "/$d" "${ROOT}/$d"
+  mount --make-rslave "${ROOT}/$d"
+done
 cp -f /etc/resolv.conf "${ROOT}/etc/resolv.conf"
 
-# ---------- Create script to run inside Arch chroot ----------
+# ---------- NEW: bind host pacman cache into chroot ----------
+mkdir -p /var/cache/pacman/pkg
+mkdir -p "${ROOT}/var/cache/pacman/pkg"
+mount --bind /var/cache/pacman/pkg "${ROOT}/var/cache/pacman/pkg"
+
+# ---------- Script to run inside Arch chroot ----------
 cat > "${ROOT}/root/in-chroot.sh" <<'ARCH_INNER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -81,10 +88,9 @@ USERNAME="${USERNAME:?missing}"
 TZ="${TZ:?missing}"
 LOCALE="${LOCALE:?missing}"
 
-echo ">>> Initializing pacman keys and minimal tooling..."
+echo ">>> Initializing pacman and installing base toolchain..."
 pacman-key --init
 pacman-key --populate archlinux
-# Minimal mirrorlist (you may replace with reflector later)
 printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist
 pacman -Sy --noconfirm arch-install-scripts gptfdisk dosfstools util-linux btrfs-progs e2fsprogs grub efibootmgr \
                        networkmanager sudo vim xfce4 xfce4-goodies lightdm lightdm-gtk-greeter firefox
@@ -180,5 +186,8 @@ env -i DEVICE="$DEVICE" HOSTNAME="$HOSTNAME" USERNAME="$USERNAME" TZ="$TZ" LOCAL
   chroot "$ROOT" /bin/bash /root/in-chroot.sh
 
 # ---------- Teardown ----------
+# Unmount cache bind first, then the rest
+umount -R "${ROOT}/var/cache/pacman/pkg" || true
 for d in dev proc sys run; do umount -R "${ROOT}/$d" || true; done
 echo "DONE. You can now boot from ${DEVICE} (Arch + XFCE, Btrfs)."
+``
