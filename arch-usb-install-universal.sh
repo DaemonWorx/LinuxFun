@@ -1,206 +1,355 @@
 #!/usr/bin/env bash
 # arch-usb-install-universal.sh
 # Universal (host-agnostic) Arch USB installer using an Arch bootstrap chroot.
-# Result: Arch on USB (Btrfs @/@home), XFCE + LightDM, GRUB (UEFI+BIOS).
-# Host: any x86-64 Linux with sudo + internet.
+# Refactored for safety, modularity, and correctness.
+#
+# DESCRIPTION:
+#   This script installs a full Arch Linux system onto a USB drive (or other target).
+#   It works from ANY x86_64 Linux host (Ubuntu, Fedora, etc.) by downloading a minimal
+#   Arch "bootstrap" environment, entering it, and using the official 'pacstrap' tool.
+#   
+#   The Resulting System:
+#     - Disk Layout: GPT, BIOS+UEFI compatible (via GRUB).
+#     - Root Filesystem: Btrfs with ZSTD compression and @/@home subvolumes.
+#     - Desktop: XFCE4 + LightDM.
+#     - Network: NetworkManager enabled.
+#     - Browser: Firefox.
+#
+#   Caching:
+#     To speed up subsequent runs, this script caches the bootstrap tarball and pacman packages
+#     in CACHE_DIR (Default: /var/cache/arch-usb-install-universal).
+#     If you wish to reclaim disk space, you can manually delete this directory:
+#       sudo rm -rf /var/cache/arch-usb-install-universal
+#
+# OPTIONS:
+#   --device <PATH>     [REQUIRED] The target block device (e.g., /dev/sdb).
+#                       WARNING: THIS DEVICE WILL BE ERASED.
+#   --hostname <NAME>   Set the hostname (Default: arch-usb).
+#   --user <NAME>       Set the non-root username (Default: archuser).
+#   --tz <TIMEZONE>     Set the timezone (Default: America/New_York).
+#   --locale <LOCALE>   Set the locale (Default: en_US.UTF-8).
+#
+# EXAMPLE:
+#   sudo ./arch-usb-install-universal.sh --device /dev/sdc --user joel --tz Europe/London
+
 set -euo pipefail
 
-# ---------- User options ----------
-DEVICE=""                 # REQUIRED: e.g. /dev/sdb  (WILL BE ERASED)
+# ---------- Configuration Defaults ----------
+DEVICE=""
 HOSTNAME="${HOSTNAME:-arch-usb}"
 USERNAME="${USERNAME:-archuser}"
 TZ="${TZ:-America/New_York}"
 LOCALE="${LOCALE:-en_US.UTF-8}"
 
-# Use a disk-backed workspace (avoid /tmp tmpfs)
-TMP_BASE="/var/lib/universal-installer"
-ARCH_TMP="${TMP_BASE}/arch"
+# Use a persistent workspace on disk (not tmpfs) to avoid RAM exhaustion
+TMP_BASE="/var/lib/universal-installer-arch-$(date +%s)"
+ARCH_ROOT="${TMP_BASE}/arch-bootstrap-root"
 ARCH_BOOTSTRAP_URL="${ARCH_BOOTSTRAP_URL:-https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst}"
+# Persistent cache directory
+CACHE_DIR="${CACHE_DIR:-/var/cache/arch-usb-install-universal}"
 
-# ---------- Helper: require root ----------
-if [[ $EUID -ne 0 ]]; then
-  exec sudo -E bash "$0" "$@"
-fi
+# ---------- Logging & Helper Functions ----------
+log() { echo -e "\033[1;34m>>> $*\033[0m"; }
+error() { echo -e "\033[1;31mERROR: $*\033[0m" >&2; exit 1; }
+warn() { echo -e "\033[1;33mWARNING: $*\033[0m" >&2; }
 
-# ---------- Parse args ----------
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --device)   DEVICE="$2"; shift 2;;
-    --hostname) HOSTNAME="$2"; shift 2;;
-    --user)     USERNAME="$2"; shift 2;;
-    --tz)       TZ="$2"; shift 2;;
-    --locale)   LOCALE="$2"; shift 2;;
-    *) echo "Unknown arg: $1"; exit 1;;
-  esac
-done
-
-[[ -b "${DEVICE:-}" ]] || { echo "ERROR: --device must be a block device (e.g., /dev/sdb)"; exit 2; }
-echo ">>> WARNING: This will ERASE ${DEVICE}"
-read -rp "Type IUNDERSTAND to continue: " ACK
-[[ "$ACK" == "IUNDERSTAND" ]] || { echo "Aborted."; exit 3; }
-
-# ---------- Host prerequisites (auto-install) ----------
-need() { command -v "$1" >/dev/null 2>&1; }
-pm_install() {
-  if   need apt-get; then apt-get update && apt-get install -y "$@"
-  elif need dnf;     then dnf install -y "$@"
-  elif need yum;     then yum install -y "$@"
-  elif need zypper;  then zypper --non-interactive install "$@"
-  elif need pacman;  then pacman -Sy --noconfirm --needed "$@"
-  elif need apk;     then apk add --no-cache "$@"
-  else echo "No supported package manager found. Install ${*} manually."; exit 4; fi
+cleanup() {
+    log "Cleaning up resources..."
+    # Recursive unmount using /proc/mounts to find everything under our root
+    # sort -r reverses order (deepest first)
+    if [ -d "$ARCH_ROOT" ]; then
+        grep "$ARCH_ROOT" /proc/mounts | cut -f2 -d" " | sort -r | while read -r mnt; do
+             umount -R "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+        done
+    fi
+    
+    # Just in case the root itself is still mounted (though the loop should catch it)
+    if mountpoint -q "$ARCH_ROOT"; then
+        umount -R "$ARCH_ROOT" 2>/dev/null || true
+    fi
+    
+    # remove workspace
+    rm -rf "$TMP_BASE"
 }
-for c in curl tar zstd lsblk blkid wipefs partprobe sgdisk mkfs.vfat mkfs.btrfs; do
-  if ! need "$c"; then
-    pm_install curl tar zstd util-linux gptfdisk dosfstools btrfs-progs e2fsprogs
-    break
-  fi
-done
+trap cleanup EXIT
 
-# Ensure workspace
-mkdir -p "$ARCH_TMP"
-cd "$ARCH_TMP"
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        exec sudo -E bash "$0" "$@"
+    fi
+}
 
-# ---------- 1) Partition + format on HOST ----------
-echo ">>> Partitioning ${DEVICE} (GPT: BIOS+ESP+Btrfs)..."
-swapoff -a || true
-umount -R /mnt 2>/dev/null || true
-for p in $(lsblk -ln -o NAME "$DEVICE" | tail -n +2); do umount -R "/dev/$p" 2>/dev/null || true; done
-wipefs -a "$DEVICE" || true
+check_deps() {
+    local missing=()
+    for cmd in curl tar zstd lsblk blkid wipefs partprobe sgdisk mkfs.vfat mkfs.btrfs; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing required dependencies on host: ${missing[*]}.\nPlease install them (e.g., arch-install-scripts, btrfs-progs, gptfdisk, dosfstools)."
+    fi
+}
 
-sgdisk -Z "$DEVICE"
-sgdisk -o \
-  -n 1:0:+1MiB   -t 1:EF02 \
-  -n 2:0:+512MiB -t 2:EF00 \
-  -n 3:0:0       -t 3:8304 "$DEVICE"
-partprobe "$DEVICE"; sleep 2; udevadm settle
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --device)   DEVICE="$2"; shift 2;;
+            --hostname) HOSTNAME="$2"; shift 2;;
+            --user)     USERNAME="$2"; shift 2;;
+            --tz)       TZ="$2"; shift 2;;
+            --locale)   LOCALE="$2"; shift 2;;
+            *) error "Unknown argument: $1";;
+        esac
+    done
 
-ESP="${DEVICE}2"
-ROOTP="${DEVICE}3"
-mkfs.vfat -F32 "$ESP"
-mkfs.btrfs -f "$ROOTP"
+    if [[ -z "$DEVICE" ]]; then
+        error "--device is required (e.g., --device /dev/sdb)"
+    fi
+    if [[ ! -b "$DEVICE" ]]; then
+        error "Device $DEVICE is not a block device."
+    fi
+    
+    # Safety Check: Root partition
+    if lsblk -no MOUNTPOINT "$DEVICE" | grep -q '^/$'; then
+        error "Device $DEVICE is currently mounted as root! Aborting immediately."
+    fi
 
-# Create Btrfs subvolumes and mount target into the future chroot's /mnt
-ROOT="${ARCH_TMP}/root.x86_64"
-mkdir -p "${ROOT}/mnt"
-mount "$ROOTP" "${ROOT}/mnt"
-btrfs subvolume create "${ROOT}/mnt/@"
-btrfs subvolume create "${ROOT}/mnt/@home"
-umount "${ROOT}/mnt"
+    warn "This will ERASE ALL DATA on $DEVICE"
+    read -rp "Type 'DESTROY' (all caps) to continue: " confirm
+    [[ "$confirm" == "DESTROY" ]] || error "Aborted by user."
+}
 
-# Remount with subvols
-mount -o noatime,compress=zstd:3,ssd,space_cache=v2,subvol=@ "$ROOTP" "${ROOT}/mnt"
-mkdir -p "${ROOT}/mnt/boot" "${ROOT}/mnt/home"
-mount -o noatime,compress=zstd:3,ssd,space_cache=v2,subvol=@home "$ROOTP" "${ROOT}/mnt/home"
-mount "$ESP" "${ROOT}/mnt/boot"
+# ---------- Core Logic ----------
 
-# ---------- 2) Bootstrap Arch chroot (minimal) ----------
-echo ">>> Downloading Arch bootstrap..."
-curl -L --fail -o arch-bootstrap.tar.zst "$ARCH_BOOTSTRAP_URL"
-echo ">>> Extracting bootstrap..."
-tar --zstd -xpf arch-bootstrap.tar.zst
+partition_and_format() {
+    log "Partitioning $DEVICE (GPT: BIOS+ESP+Btrfs)..."
+    
+    # Unmount everything on device
+    for part in $(lsblk -ln -o NAME "$DEVICE" | tail -n +2); do
+        umount -R "/dev/$part" 2>/dev/null || true
+    done
+    wipefs -a "$DEVICE"
 
-# Make '/' a real mountpoint inside the chroot (critical for pacman)
-ROOT="${ARCH_TMP}/root.x86_64"
-mount --bind "$ROOT" "$ROOT"
-mount --make-private "$ROOT"
+    # 1. BIOS boot (1M) - Type EF02
+    # 2. ESP (512M) - Type EF00
+    # 3. Root (Rest) - Type 8304 (Linux x86-64 root)
+    sgdisk -Z "$DEVICE"
+    sgdisk -o \
+        -n 1:0:+1MiB   -t 1:EF02 \
+        -n 2:0:+512MiB -t 2:EF00 \
+        -n 3:0:0       -t 3:8304 \
+        "$DEVICE"
+    
+    partprobe "$DEVICE"
+    sleep 2
+    
+    # Detect partitions (handle /dev/nvme0n1pX vs /dev/sdX case)
+    if [[ "$DEVICE" == *"nvme"* ]] || [[ "$DEVICE" == *"mmcblk"* ]]; then
+        P_ESP="${DEVICE}p2"
+        P_ROOT="${DEVICE}p3"
+    else
+        P_ESP="${DEVICE}2"
+        P_ROOT="${DEVICE}3"
+    fi
 
-# Bind mounts + DNS
-for d in dev proc sys run; do
-  mount --rbind "/$d" "${ROOT}/$d"
-  mount --make-rslave "${ROOT}/$d"
-done
-cp -f /etc/resolv.conf "${ROOT}/etc/resolv.conf"
+    log "Formatting partitions..."
+    mkfs.vfat -F32 -n "ARCH_EFI" "$P_ESP"
+    mkfs.btrfs -f -L "ARCH_ROOT" "$P_ROOT"
+    
+    # Btrfs Subvolumes
+    log "Creating Btrfs subvolumes..."
+    # Mount temporarily to create subvols
+    mkdir -p "${TMP_BASE}/mnt_tmp"
+    mount "$P_ROOT" "${TMP_BASE}/mnt_tmp"
+    btrfs subvolume create "${TMP_BASE}/mnt_tmp/@"
+    btrfs subvolume create "${TMP_BASE}/mnt_tmp/@home"
+    umount "${TMP_BASE}/mnt_tmp"
+}
 
-# Bind host pacman cache (prevents chroot space issues)
-mkdir -p /var/cache/pacman/pkg
-mkdir -p "${ROOT}/var/cache/pacman/pkg"
-mount --bind /var/cache/pacman/pkg "${ROOT}/var/cache/pacman/pkg"
+prepare_bootstrap() {
+    log "Setting up Arch bootstrap environment at $ARCH_ROOT..."
+    mkdir -p "$ARCH_ROOT"
+    mkdir -p "$CACHE_DIR"
+    
+    local bootstrap_file="archlinux-bootstrap-x86_64.tar.zst"
+    local cache_path="${CACHE_DIR}/${bootstrap_file}"
+    
+    if [[ -f "$cache_path" ]]; then
+        log "Using cached bootstrap from $cache_path"
+    else
+        log "Downloading Arch bootstrap to cache..."
+        curl -L --fail -o "$cache_path" "$ARCH_BOOTSTRAP_URL"
+    fi
 
-# ---------- 3) Minimal tooling INSIDE chroot, pacstrap to USB ----------
-cat > "${ROOT}/root/in-chroot.sh" <<'ARCH_INNER'
+    cd "$TMP_BASE"
+    log "Extracting bootstrap..."
+    tar --zstd -xpf "$cache_path"
+    
+    # The tarball contains root.x86_64 folder
+    # We move it to our target path or just simlink
+    if [ -d "root.x86_64" ]; then
+        mount --bind "root.x86_64" "$ARCH_ROOT"
+    else
+        error "Extraction failed: root.x86_64 directory not found."
+    fi
+    
+    # Make the root private for bind mounts
+    mount --make-private "$ARCH_ROOT"
+
+    # Bind mounts for chroot functionality
+    for d in dev proc sys run; do
+        mount --rbind "/$d" "${ARCH_ROOT}/$d"
+        mount --make-rslave "${ARCH_ROOT}/$d"
+    done
+    
+    # DNS
+    mkdir -p "${ARCH_ROOT}/etc"
+    cp /etc/resolv.conf "${ARCH_ROOT}/etc/resolv.conf"
+    
+    
+    # Bind host pacman cache if exists, OR use our persistent cache
+    mkdir -p "${ARCH_ROOT}/var/cache/pacman/pkg"
+    mkdir -p "${CACHE_DIR}/pkg"
+    
+    # Mount our persistent cache
+    mount --bind "${CACHE_DIR}/pkg" "${ARCH_ROOT}/var/cache/pacman/pkg"
+    
+    # If host has a cache, maybe we could have used it, but a dedicated cache 
+    # for this tool is safer/more predictable across distros.
+}
+
+mount_target_in_chroot() {
+    log "Mounting target USB inside the bootstrap environment..."
+    # We need to mount the target device *inside* the bootstrap root
+    # so 'pacstrap' inside can see it at /mnt.
+    
+    local CHROOT_MNT="${ARCH_ROOT}/mnt"
+    mkdir -p "$CHROOT_MNT"
+    
+    if [[ "$DEVICE" == *"nvme"* ]] || [[ "$DEVICE" == *"mmcblk"* ]]; then
+        P_ESP="${DEVICE}p2"
+        P_ROOT="${DEVICE}p3"
+    else
+        P_ESP="${DEVICE}2"
+        P_ROOT="${DEVICE}3"
+    fi
+
+    # Mount Root (subvol=@)
+    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@ "$P_ROOT" "$CHROOT_MNT"
+    
+    # Mount Home
+    mkdir -p "${CHROOT_MNT}/home"
+    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@home "$P_ROOT" "${CHROOT_MNT}/home"
+    
+    # Mount Boot
+    mkdir -p "${CHROOT_MNT}/boot"
+    mount "$P_ESP" "${CHROOT_MNT}/boot"
+}
+
+generate_install_script() {
+    cat > "${ARCH_ROOT}/root/install_internal.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOSTNAME="${HOSTNAME:?missing}"
-USERNAME="${USERNAME:?missing}"
-TZ="${TZ:?missing}"
-LOCALE="${LOCALE:?missing}"
+HOSTNAME="$HOSTNAME"
+USERNAME="$USERNAME"
+TZ="$TZ"
+LOCALE="$LOCALE"
 
-# Minimal init for pacman
+echo ">>> [BOOTSTRAP] Initializing pacman keys..."
 pacman-key --init
-pacman-key --populate archlinux
-printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist
+pacman-key --populate archlinux || true # Might fail if keys outdated, but init is key
+# Use a geographically diverse mirrorlist
+printf 'Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch\n' > /etc/pacman.d/mirrorlist
 
-# ONLY the installer scripts; do NOT install desktop here
+echo ">>> [BOOTSTRAP] Installing installer tools..."
 pacman -Sy --noconfirm arch-install-scripts
 
-# Install Arch onto the ALREADY-MOUNTED target at /mnt
-pacstrap /mnt base linux linux-firmware networkmanager sudo vim btrfs-progs intel-ucode amd-ucode \
-         xfce4 xfce4-goodies lightdm lightdm-gtk-greeter firefox grub efibootmgr
+echo ">>> [BOOTSTRAP] Installing System to /mnt..."
+# Packages: Base, Kernel, Firmware, File systems, Network, Tools, Desktop
+pacstrap /mnt base linux linux-firmware networkmanager sudo vim btrfs-progs \
+    intel-ucode amd-ucode xfce4 xfce4-goodies lightdm lightdm-gtk-greeter \
+    firefox grub efibootmgr
 
-# Generate fstab + tune mount options
+echo ">>> [BOOTSTRAP] Generating fstab..."
 genfstab -U /mnt > /mnt/etc/fstab
-sed -i 's|\(\s/\s\)btrfs\s\w\+|\1btrfs rw,noatime,compress=zstd:3,ssd,space_cache=v2,subvol=@|' /mnt/etc/fstab
-sed -i 's|\(\s/home\s\)btrfs\s\w\+|\1btrfs rw,noatime,compress=zstd:3,ssd,space_cache=v2,subvol=@home|' /mnt/etc/fstab
 
-# Post-config inside installed system
-arch-chroot /mnt /bin/bash <<EOS
+echo ">>> [BOOTSTRAP] Configuring installed system..."
+arch-chroot /mnt /bin/bash <<INNER
 set -euo pipefail
 
-ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime
+# Time & Locale
+ln -sf /usr/share/zoneinfo/\$TZ /etc/localtime
 hwclock --systohc
-sed -i "s/^#${LOCALE}/${LOCALE}/" / /etc/locale.gen || true
+sed -i "s/^#\$LOCALE/\$LOCALE/" /etc/locale.gen
 locale-gen
-echo "LANG=${LOCALE}" > /etc/locale.conf
+echo "LANG=\$LOCALE" > /etc/locale.conf
+echo "\$HOSTNAME" > /etc/hostname
 
-echo "${HOSTNAME}" > /etc/hostname
-cat > /etc/hosts <<HST
-127.0.0.1 localhost
-::1       localhost
-127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
-HST
+# Network
+echo "127.0.0.1 localhost" >> /etc/hosts
+echo "::1       localhost" >> /etc/hosts
+systemctl enable NetworkManager
 
-echo "root:archusb" | chpasswd
-useradd -m -G wheel -s /bin/bash ${USERNAME}
-echo "${USERNAME}:archusb" | chpasswd
-sed -i 's/^# %wheel/%wheel/' /etc/sudoers
+# Users
+echo "root:root" | chpasswd
+useradd -m -G wheel -s /bin/bash \$USERNAME
+echo "\$USERNAME:\$USERNAME" | chpasswd
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
 
-# Portable initramfs
-sed -i 's/^HOOKS=.*/HOOKS=(base udev keyboard keymap block autodetect modconf filesystems fsck)/' /etc/mkinitcpio.conf
+# Initramfs (generic hooks for USB portability)
+echo "KEYMAP=us" > /etc/vconsole.conf
+echo "FONT=" >> /etc/vconsole.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base udev block keyboard keymap autodetect modconf filesystems fsck)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
-# Bootloader (UEFI + BIOS)
-grub-install --target=i386-pc --recheck /dev/$(lsblk -no pkname /mnt | head -n1) || true
-grub-install --target=x86_64-efi --efi-directory=/boot --removable --recheck || true
+# Bootloader
+    # We identify the device from the bootstrap environment (where /mnt/boot is mounted)
+    # and pass it into the chroot.
+    BOOT_DEV=\$(findmnt -n -o SOURCE -T /mnt/boot | sed 's/[0-9]*$//' | sed 's/p$//')
+
+    echo ">>> [INNER] Installing GRUB to \$BOOT_DEV..."
+    # BIOS
+    grub-install --target=i386-pc --recheck --removable "\$BOOT_DEV"
+# UEFI
+grub-install --target=x86_64-efi --efi-directory=/boot --removable --recheck
+
 grub-mkconfig -o /boot/grub/grub.cfg
 
-systemctl enable NetworkManager
+# DM
 systemctl enable lightdm
+INNER
 
-# Light write-wear
-sed -i 's/ defaults/ defaults,noatime/' /etc/fstab
-mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/10-volatile.conf <<J
-[Journal]
-Storage=volatile
-SystemMaxUse=16M
-RuntimeMaxUse=32M
-J
-EOS
+echo ">>> [BOOTSTRAP] Install Complete."
+EOF
+    chmod +x "${ARCH_ROOT}/root/install_internal.sh"
+}
 
-sync
-ARCH_INNER
-chmod +x "${ROOT}/root/in-chroot.sh"
+run_install() {
+    log "Running installation inside bootstrap environment..."
+    # We strip environment variables to ensure clean execution, passing only explicit ones
+    env -i HOSTNAME="$HOSTNAME" USERNAME="$USERNAME" TZ="$TZ" LOCALE="$LOCALE" \
+        chroot "$ARCH_ROOT" /bin/bash /root/install_internal.sh
+}
 
-# Pass env + run inside chroot
-env -i HOSTNAME="$HOSTNAME" USERNAME="$USERNAME" TZ="$TZ" LOCALE="$LOCALE" \
-  chroot "$ROOT" /bin/bash /root/in-chroot.sh
+# ---------- Main Execution ----------
+main() {
+    check_root
+    parse_args "$@"
+    check_deps
+    
+    partition_and_format
+    prepare_bootstrap
+    mount_target_in_chroot
+    generate_install_script
+    run_install
+    
+    log "SUCCESS! Arch Linux installed on $DEVICE."
+    log "Credentials:"
+    log "  Root: root / root"
+    log "  User: $USERNAME / $USERNAME"
+}
 
-# ---------- 4) Teardown + unmount target ----------
-umount -R "${ROOT}/var/cache/pacman/pkg" || true
-for d in dev proc sys run; do umount -R "${ROOT}/$d" || true; done
-umount -R "${ROOT}" || true
-
-umount -R "${ROOT}/mnt" 2>/dev/null || true
-echo "DONE. You can now boot from ${DEVICE} (Arch + XFCE, Btrfs)."
+main "$@"
